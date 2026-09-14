@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import Image from "next/image";
 import { getPremiumVoices, getBestNaturalVoice, type SpeechVoiceOption } from "@/lib/services/voice";
+import { MobileVoiceRecorder } from "@/lib/services/audioRecorder";
 import type { Mode } from "@/lib/types/database";
 
 interface VoiceCallModalProps {
@@ -20,7 +21,7 @@ export default function VoiceCallModal({
   initialGreeting = "Hello! I'm Sona AI. How can I assist you today?",
   mode = "general",
 }: VoiceCallModalProps) {
-  const [status, setStatus] = useState<"connecting" | "listening" | "speaking" | "ended">("connecting");
+  const [status, setStatus] = useState<"connecting" | "listening" | "transcribing" | "thinking" | "speaking" | "ended">("connecting");
   const [transcript, setTranscript] = useState("");
   const [aiResponse, setAiResponse] = useState("");
   const [isMuted, setIsMuted] = useState(false);
@@ -30,80 +31,32 @@ export default function VoiceCallModal({
   const [selectedVoiceName, setSelectedVoiceName] = useState<string>("");
   const [micPermissionError, setMicPermissionError] = useState<string | null>(null);
 
-  // Hardware & Audio stream refs
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const animFrameRef = useRef<number | null>(null);
-  const recognitionRef = useRef<any>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const hasSpokenInTurnRef = useRef(false);
-  const isTranscribingRef = useRef(false);
+  // Recorder and Hardware Refs
+  const recorderRef = useRef<MobileVoiceRecorder | null>(null);
   const isSpeakingRef = useRef(false);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isTranscribingRef = useRef(false);
   const isOpenRef = useRef(isOpen);
   const isMutedRef = useRef(isMuted);
   const selectedVoiceNameRef = useRef(selectedVoiceName);
-  const initialGreetingRef = useRef(initialGreeting);
   const onSendMessageRef = useRef(onSendMessage);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const animSpeakingRef = useRef<number | null>(null);
 
   isOpenRef.current = isOpen;
   isMutedRef.current = isMuted;
   selectedVoiceNameRef.current = selectedVoiceName;
-  initialGreetingRef.current = initialGreeting;
   onSendMessageRef.current = onSendMessage;
 
   // Complete hardware & audio teardown: guaranteed zero microphone leaks on call end
   const stopAllAudioAndHardware = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {}
-      mediaRecorderRef.current = null;
-    }
-    audioChunksRef.current = [];
-
-    if (mediaStreamRef.current) {
-      try {
-        mediaStreamRef.current.getTracks().forEach((track) => {
-          track.stop();
-          track.enabled = false;
-        });
-      } catch (err) {
-        console.warn("[Voice Call] Error stopping media tracks:", err);
-      }
-      mediaStreamRef.current = null;
+    if (recorderRef.current) {
+      recorderRef.current.destroy();
+      recorderRef.current = null;
     }
 
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current);
-      animFrameRef.current = null;
-    }
-    if (audioContextRef.current) {
-      try {
-        if (audioContextRef.current.state !== "closed") {
-          audioContextRef.current.close().catch(() => {});
-        }
-      } catch (err) {
-        console.warn("[Voice Call] Error closing AudioContext:", err);
-      }
-      audioContextRef.current = null;
-    }
-    analyserRef.current = null;
-
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.onstart = null;
-        recognitionRef.current.onresult = null;
-        recognitionRef.current.onerror = null;
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
-      } catch (err) {
-        console.warn("[Voice Call] Error aborting recognition:", err);
-      }
-      recognitionRef.current = null;
+    if (animSpeakingRef.current) {
+      cancelAnimationFrame(animSpeakingRef.current);
+      animSpeakingRef.current = null;
     }
 
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
@@ -112,17 +65,12 @@ export default function VoiceCallModal({
       } catch {}
     }
 
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     }
 
     isSpeakingRef.current = false;
-    hasSpokenInTurnRef.current = false;
     isTranscribingRef.current = false;
     setAudioLevel(0);
   }, []);
@@ -154,148 +102,21 @@ export default function VoiceCallModal({
     };
   }, []);
 
-  const handleUserSpokeRef = useRef<(text: string) => void>(() => {});
+  // Forward ref declaration for turn-taking
+  const startListeningLoopRef = useRef<() => void>(() => {});
+  const finalizeAndTranscribeRef = useRef<() => Promise<void>>(async () => {});
 
-  // Transcribe recorded audio chunk with fast server STT
-  const transcribeCurrentAudioChunk = useCallback(async () => {
-    if (isTranscribingRef.current || isSpeakingRef.current || !isOpenRef.current) return;
-    if (audioChunksRef.current.length === 0) return;
-
-    const chunks = [...audioChunksRef.current];
-    audioChunksRef.current = [];
-    hasSpokenInTurnRef.current = false;
-
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : MediaRecorder.isTypeSupported("audio/mp4")
-      ? "audio/mp4"
-      : "audio/webm";
-
-    const audioBlob = new Blob(chunks, { type: mimeType });
-    if (audioBlob.size < 400) return; // ignore tiny clicks
-
-    isTranscribingRef.current = true;
-    try {
-      const ext = mimeType.includes("mp4") ? "mp4" : "webm";
-      const formData = new FormData();
-      formData.append("audio", audioBlob, `live_call.${ext}`);
-
-      const res = await fetch("/api/stt/transcribe", {
-        method: "POST",
-        body: formData,
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.transcript && data.transcript.trim() && isOpenRef.current && !isSpeakingRef.current) {
-          handleUserSpokeRef.current(data.transcript.trim());
-        }
-      }
-    } catch (err) {
-      console.warn("[Voice Call] STT fallback notice:", err);
-    } finally {
-      isTranscribingRef.current = false;
-    }
-  }, []);
-
-  // Setup Live Mic Audio Analyser for responsive visualizer waveform & Voice Activity Detection
-  const startAudioAnalyser = useCallback(async () => {
-    if (typeof window === "undefined") return;
-
-    try {
-      if (!mediaStreamRef.current) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-        if (!isOpenRef.current) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        mediaStreamRef.current = stream;
-      }
-
-      const stream = mediaStreamRef.current;
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtx && !audioContextRef.current) {
-        const audioCtx = new AudioCtx();
-        const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 64;
-        analyser.smoothingTimeConstant = 0.8;
-
-        const source = audioCtx.createMediaStreamSource(stream);
-        source.connect(analyser);
-
-        audioContextRef.current = audioCtx;
-        analyserRef.current = analyser;
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-        const updateLevel = () => {
-          if (!analyserRef.current || !isOpenRef.current) return;
-          analyserRef.current.getByteFrequencyData(dataArray);
-
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
-          const avg = sum / dataArray.length;
-          const normalized = Math.min(1, Math.max(0, avg / 128));
-
-          // Real-time audio reactive visualizer level
-          if (!isMutedRef.current && !isSpeakingRef.current) {
-            setAudioLevel(normalized);
-          } else if (isSpeakingRef.current) {
-            setAudioLevel(0.35 + Math.sin(Date.now() / 130) * 0.25);
-          } else {
-            setAudioLevel(0);
-          }
-
-          animFrameRef.current = requestAnimationFrame(updateLevel);
-        };
-
-
-        animFrameRef.current = requestAnimationFrame(updateLevel);
-      }
-    } catch (err: any) {
-      console.warn("[Voice Call] Mic stream notice:", err);
-      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
-        setMicPermissionError("Microphone permission was denied. Please enable mic access in your browser settings.");
-      }
-    }
-  }, []);
-
-  // Text-to-speech synthesis helper
+  // Text-to-speech synthesis helper with mobile natural pitch and speaking wave
   const speak = useCallback((text: string, onComplete?: () => void) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window) || !isOpenRef.current) {
       onComplete?.();
       return;
     }
 
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
-      } catch {}
-    }
-
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-      try {
-        mediaRecorderRef.current.pause();
-      } catch {}
-    }
-    audioChunksRef.current = [];
-    hasSpokenInTurnRef.current = false;
-
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.05;
-    utterance.pitch = 1.05;
+    utterance.rate = 1.02;
+    utterance.pitch = 1.0;
     utterance.lang = "en-US";
 
     const voice = getBestNaturalVoice(selectedVoiceNameRef.current);
@@ -306,222 +127,194 @@ export default function VoiceCallModal({
     isSpeakingRef.current = true;
     setStatus("speaking");
 
-    utterance.onend = () => {
+    // Dynamic wave animation during AI speech
+    let waveStep = 0;
+    const animateSpeakingWave = () => {
+      if (!isSpeakingRef.current || !isOpenRef.current) return;
+      waveStep += 0.08;
+      const simulatedLvl = 0.28 + Math.sin(waveStep) * 0.2 + Math.cos(waveStep * 1.5) * 0.1;
+      setAudioLevel(Math.max(0.1, Math.min(0.7, simulatedLvl)));
+      animSpeakingRef.current = requestAnimationFrame(animateSpeakingWave);
+    };
+    animSpeakingRef.current = requestAnimationFrame(animateSpeakingWave);
+
+    const finishSpeaking = () => {
       if (!isOpenRef.current) return;
       isSpeakingRef.current = false;
+      if (animSpeakingRef.current) {
+        cancelAnimationFrame(animSpeakingRef.current);
+        animSpeakingRef.current = null;
+      }
+      setAudioLevel(0);
+
       setTimeout(() => {
         if (isOpenRef.current && !isMutedRef.current) {
           onComplete?.();
         }
-      }, 200);
+      }, 250);
     };
 
-    utterance.onerror = () => {
-      if (!isOpenRef.current) return;
-      isSpeakingRef.current = false;
-      setTimeout(() => {
-        if (isOpenRef.current && !isMutedRef.current) {
-          onComplete?.();
-        }
-      }, 200);
-    };
+    utterance.onend = finishSpeaking;
+    utterance.onerror = finishSpeaking;
 
     window.speechSynthesis.speak(utterance);
   }, []);
 
-  // Initialize and start Speech Recognition + MediaRecorder fallback
-  const startListening = useCallback(() => {
-    if (typeof window === "undefined" || !isOpenRef.current || isMutedRef.current || isSpeakingRef.current) return;
+  // Dispatch transcription to ultra-fast Whisper Turbo route (~150ms)
+  const finalizeAndTranscribe = useCallback(async () => {
+    if (isTranscribingRef.current || isSpeakingRef.current || !isOpenRef.current) return;
 
-    setStatus("listening");
-    hasSpokenInTurnRef.current = false;
-    audioChunksRef.current = [];
+    if (!recorderRef.current || !recorderRef.current.getIsRecording()) return;
 
-    // 1. Start MediaRecorder on active stream for universal mobile STT fallback
-    if (mediaStreamRef.current) {
-      try {
-        if (!mediaRecorderRef.current || mediaRecorderRef.current.state === "inactive") {
-          const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-            ? "audio/webm;codecs=opus"
-            : MediaRecorder.isTypeSupported("audio/mp4")
-            ? "audio/mp4"
-            : "";
-
-          const recorder = new MediaRecorder(mediaStreamRef.current, mimeType ? { mimeType } : undefined);
-          recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0) {
-              audioChunksRef.current.push(e.data);
-            }
-          };
-          mediaRecorderRef.current = recorder;
-          recorder.start(200);
-        } else if (mediaRecorderRef.current.state === "paused") {
-          mediaRecorderRef.current.resume();
-        }
-      } catch (recErr) {
-        console.warn("[Voice Call] MediaRecorder start notice:", recErr);
-      }
-    }
-
-    // 2. Start Web Speech API in parallel (instant if supported)
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) return;
+    isTranscribingRef.current = true;
+    setStatus("transcribing");
 
     try {
-      if (recognitionRef.current) {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
+      const result = await recorderRef.current.stop();
+      if (!result || !result.blob || result.blob.size < 400) {
+        // Accidental silence/click, resume listening
+        isTranscribingRef.current = false;
+        if (isOpenRef.current && !isMutedRef.current && !isSpeakingRef.current) {
+          startListeningLoopRef.current();
+        }
+        return;
       }
 
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = "en-US";
+      const formData = new FormData();
+      formData.append("audio", result.blob, `live_call.${result.extension}`);
 
-      recognition.onstart = () => {
-        if (isOpenRef.current && !isSpeakingRef.current) {
-          setStatus("listening");
-        }
-      };
+      const res = await fetch("/api/stt/transcribe", {
+        method: "POST",
+        body: formData,
+      });
 
-      recognition.onresult = (event: any) => {
-        if (!isOpenRef.current || isSpeakingRef.current) return;
-
-        let currentText = "";
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          currentText += event.results[i][0].transcript;
-        }
-
-        const trimmed = currentText.trim();
-        if (trimmed && trimmed.length > 1) {
-          setTranscript(trimmed);
-          hasSpokenInTurnRef.current = true;
-
-          // Natural 1100ms silence debounce so user isn't cut off during brief pauses
-          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-          silenceTimerRef.current = setTimeout(() => {
-            audioChunksRef.current = []; // cleared since Web Speech transcribed it
-            handleUserSpokeRef.current(trimmed);
-          }, 1100);
-
-        }
-      };
-
-      recognition.onerror = (e: any) => {
-        if (e.error !== "no-speech") {
-          console.warn("[Voice Call] Recognition notice:", e.error);
-        }
-      };
-
-      recognition.onend = () => {
-        if (isOpenRef.current && !isSpeakingRef.current && !isMutedRef.current) {
-          try {
-            recognition.start();
-          } catch {}
-        }
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch (err) {
-      console.warn("[Voice Call] SpeechRecognition notice:", err);
-    }
-  }, []);
-
-  // Handle user speech transmission (lightning fast, no thinking modal/popup)
-  const handleUserSpoke = useCallback(
-    async (userText: string) => {
-      if (!userText.trim() || !isOpenRef.current || isSpeakingRef.current) return;
-
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.onend = null;
-          recognitionRef.current.abort();
-        } catch {}
+      if (!res.ok) {
+        throw new Error("STT request failed");
       }
 
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        try {
-          mediaRecorderRef.current.pause();
-        } catch {}
-      }
-      audioChunksRef.current = [];
-      hasSpokenInTurnRef.current = false;
+      const data = await res.json();
+      const userText = (data.transcript || "").trim();
 
+      if (!userText || !isOpenRef.current) {
+        // No distinct speech detected, resume listening
+        isTranscribingRef.current = false;
+        if (isOpenRef.current && !isMutedRef.current && !isSpeakingRef.current) {
+          startListeningLoopRef.current();
+        }
+        return;
+      }
+
+      // Valid user speech!
       setTranscript(userText);
+      setStatus("thinking");
 
-      try {
-        const reply = await onSendMessageRef.current(userText);
-        if (!isOpenRef.current) return;
+      // Send to AI for response
+      const reply = await onSendMessageRef.current(userText);
+      if (!isOpenRef.current) return;
 
-        const replyText = typeof reply === "string" ? reply : "I understand. How else can I assist you?";
-        setAiResponse(replyText);
-        setTranscript("");
+      const replyText = typeof reply === "string" ? reply : "I understand. How else can I assist you?";
+      setAiResponse(replyText);
+      setTranscript("");
 
-        speak(replyText, () => {
-          if (isOpenRef.current && !isMutedRef.current) {
-            startListening();
-          }
-        });
-      } catch (err) {
-        if (!isOpenRef.current) return;
-        console.error("[Voice Call] AI error:", err);
-        const errMsg = "I had trouble processing that. Could you please say that again?";
+      // AI speaks the response, then auto-resumes listening
+      speak(replyText, () => {
+        if (isOpenRef.current && !isMutedRef.current) {
+          startListeningLoopRef.current();
+        }
+      });
+    } catch (err) {
+      console.warn("[Voice Call] Turn error:", err);
+      if (isOpenRef.current) {
+        const errMsg = "I had trouble hearing that. Could you please say that again?";
         setAiResponse(errMsg);
         speak(errMsg, () => {
           if (isOpenRef.current && !isMutedRef.current) {
-            startListening();
+            startListeningLoopRef.current();
           }
         });
       }
-    },
-    [speak, startListening]
-  );
-  handleUserSpokeRef.current = handleUserSpoke;
+    } finally {
+      isTranscribingRef.current = false;
+    }
+  }, [speak]);
+  finalizeAndTranscribeRef.current = finalizeAndTranscribe;
 
-  // Mute / Unmute handler
-  const toggleMute = useCallback(() => {
-    if (isMuted) {
-      setIsMuted(false);
-      isMutedRef.current = false;
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = true));
+  // Start responsive listening loop with VAD
+  const startListeningLoop = useCallback(async () => {
+    if (typeof window === "undefined" || !isOpenRef.current || isMutedRef.current || isSpeakingRef.current) return;
+
+    setStatus("listening");
+    setTranscript("");
+
+    try {
+      if (!recorderRef.current) {
+        recorderRef.current = new MobileVoiceRecorder({
+          onAudioLevel: (lvl) => {
+            if (isOpenRef.current && !isSpeakingRef.current && !isMutedRef.current) {
+              setAudioLevel(lvl);
+            }
+          },
+          enableVAD: true,
+          silenceThreshold: 0.04,
+          silenceDurationMs: 1400,
+          minSpeechDurationMs: 650,
+          onSpeechEnd: () => {
+            finalizeAndTranscribeRef.current();
+          },
+        });
       }
-      if (!isSpeakingRef.current) {
-        startListening();
-      }
-    } else {
-      setIsMuted(true);
-      isMutedRef.current = true;
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getAudioTracks().forEach((t) => (t.enabled = false));
-      }
-      if (recognitionRef.current) {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
+
+      await recorderRef.current.start();
+      setMicPermissionError(null);
+    } catch (err: any) {
+      console.warn("[Voice Call] Recorder start error:", err);
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        setMicPermissionError("Microphone permission was denied. Please allow microphone access in your browser settings.");
       }
     }
-  }, [isMuted, startListening]);
+  }, []);
+  startListeningLoopRef.current = startListeningLoop;
 
-  // Interrupt AI speech handler or push-to-transcribe when listening
+  // Interrupt AI speech (Barge-In) or Push-To-Send
   const handleOrbClick = useCallback(() => {
     if (status === "speaking" || isSpeakingRef.current) {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
       isSpeakingRef.current = false;
+      if (animSpeakingRef.current) {
+        cancelAnimationFrame(animSpeakingRef.current);
+        animSpeakingRef.current = null;
+      }
       setAiResponse("");
       if (!isMutedRef.current) {
-        startListening();
+        startListeningLoop();
       } else {
         setStatus("listening");
       }
-    } else if (status === "listening" && !isMutedRef.current && hasSpokenInTurnRef.current) {
-      transcribeCurrentAudioChunk();
+    } else if (status === "listening" && !isMutedRef.current) {
+      // Manual tap to send turn immediately
+      finalizeAndTranscribe();
     }
-  }, [status, startListening, transcribeCurrentAudioChunk]);
+  }, [status, startListeningLoop, finalizeAndTranscribe]);
+
+  // Mute / Unmute handler
+  const toggleMute = useCallback(() => {
+    if (isMuted) {
+      setIsMuted(false);
+      isMutedRef.current = false;
+      if (!isSpeakingRef.current) {
+        startListeningLoop();
+      }
+    } else {
+      setIsMuted(true);
+      isMutedRef.current = true;
+      if (recorderRef.current) {
+        recorderRef.current.stop();
+      }
+      setAudioLevel(0);
+    }
+  }, [isMuted, startListeningLoop]);
 
   // Lifecycle when modal opens
   useEffect(() => {
@@ -536,19 +329,18 @@ export default function VoiceCallModal({
     setIsMuted(false);
     isMutedRef.current = false;
     setStatus("speaking");
-    const greeting = initialGreetingRef.current;
+    const greeting = initialGreeting;
     setAiResponse(greeting);
 
     timerIntervalRef.current = setInterval(() => {
       setCallDuration((prev) => prev + 1);
     }, 1000);
 
-    startAudioAnalyser().then(() => {
-      speak(greeting, () => {
-        if (isOpenRef.current && !isMutedRef.current) {
-          startListening();
-        }
-      });
+    // Initial greeting delivery -> auto-start conversational listening
+    speak(greeting, () => {
+      if (isOpenRef.current && !isMutedRef.current) {
+        startListeningLoop();
+      }
     });
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -565,7 +357,6 @@ export default function VoiceCallModal({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
-
 
   if (!isOpen) return null;
 
@@ -601,6 +392,8 @@ export default function VoiceCallModal({
           className={`pointer-events-none absolute -top-16 left-1/2 -translate-x-1/2 h-80 w-80 rounded-full blur-[110px] transition-all duration-1000 ${
             status === "speaking"
               ? "bg-amber-500/25"
+              : status === "transcribing" || status === "thinking"
+              ? "bg-indigo-500/30"
               : isMuted
               ? "bg-rose-500/20"
               : "bg-emerald-500/25"
@@ -680,33 +473,55 @@ export default function VoiceCallModal({
           )}
 
           <div className="relative flex items-center justify-center my-6 sm:my-8">
+            {/* Outer Ripple 1 */}
             <div
               style={{
-                transform: `scale(${1 + audioLevel * 0.4})`,
-                opacity: status === "listening" && !isMuted ? 0.7 + audioLevel * 0.3 : 0.15,
+                transform: `scale(${1 + audioLevel * 0.45})`,
+                opacity: status === "listening" && !isMuted ? 0.6 + audioLevel * 0.4 : status === "speaking" ? 0.45 : 0.1,
               }}
-              className="absolute h-48 w-48 sm:h-56 sm:w-56 rounded-full border border-white/15 transition-transform duration-100 ease-out"
-            />
-            <div
-              style={{
-                transform: `scale(${1 + audioLevel * 0.7})`,
-                opacity: status === "listening" && !isMuted ? 0.4 + audioLevel * 0.4 : 0.08,
-              }}
-              className="absolute h-60 w-60 sm:h-68 sm:w-68 rounded-full border border-white/10 transition-transform duration-150 ease-out"
+              className={`absolute h-48 w-48 sm:h-56 sm:w-56 rounded-full border transition-transform duration-75 ease-out ${
+                status === "speaking"
+                  ? "border-amber-400/30"
+                  : status === "transcribing" || status === "thinking"
+                  ? "border-indigo-400/30"
+                  : isMuted
+                  ? "border-rose-500/20"
+                  : "border-emerald-400/30"
+              }`}
             />
 
+            {/* Outer Ripple 2 */}
+            <div
+              style={{
+                transform: `scale(${1 + audioLevel * 0.75})`,
+                opacity: status === "listening" && !isMuted ? 0.35 + audioLevel * 0.45 : status === "speaking" ? 0.25 : 0.05,
+              }}
+              className={`absolute h-60 w-60 sm:h-68 sm:w-68 rounded-full border transition-transform duration-100 ease-out ${
+                status === "speaking"
+                  ? "border-amber-400/20"
+                  : status === "transcribing" || status === "thinking"
+                  ? "border-indigo-400/20"
+                  : isMuted
+                  ? "border-rose-500/15"
+                  : "border-emerald-400/20"
+              }`}
+            />
+
+            {/* Main Interactive Orb */}
             <button
               onClick={handleOrbClick}
               title={
                 status === "speaking"
                   ? "Tap to interrupt Sona AI"
                   : status === "listening"
-                  ? "Tap to send speech immediately"
+                  ? "Tap to send speech now"
                   : undefined
               }
               className={`group relative flex h-36 w-36 sm:h-40 sm:w-40 items-center justify-center rounded-full border shadow-2xl transition-all duration-300 select-none ${
                 status === "speaking"
                   ? "border-amber-400/40 bg-gradient-to-tr from-amber-600 via-amber-400 to-yellow-200 text-ink-950 scale-105 shadow-amber-500/40 hover:scale-100 active:scale-95 cursor-pointer ring-4 ring-amber-400/20"
+                  : status === "transcribing" || status === "thinking"
+                  ? "border-indigo-400/40 bg-gradient-to-tr from-indigo-700 via-purple-500 to-pink-400 text-white scale-100 shadow-indigo-500/35 ring-4 ring-indigo-400/20 animate-pulse"
                   : isMuted
                   ? "border-rose-500/40 bg-gradient-to-tr from-rose-950 via-ink-900 to-rose-900 text-rose-400 scale-95 shadow-rose-500/20"
                   : "border-emerald-400/40 bg-gradient-to-tr from-emerald-600 via-teal-400 to-cyan-300 text-ink-950 scale-100 shadow-emerald-500/35 ring-4 ring-emerald-400/20 active:scale-95 cursor-pointer"
@@ -727,6 +542,16 @@ export default function VoiceCallModal({
                     Tap to Stop
                   </span>
                 </div>
+              ) : status === "transcribing" || status === "thinking" ? (
+                <div className="relative flex flex-col items-center gap-1.5">
+                  <svg className="animate-spin h-7 w-7 text-white" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                  </svg>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-white/90">
+                    {status === "transcribing" ? "Transcribing" : "Thinking"}
+                  </span>
+                </div>
               ) : (
                 <div className="relative flex flex-col items-center justify-center">
                   {isMuted ? (
@@ -737,12 +562,17 @@ export default function VoiceCallModal({
                       <line x1="12" y1="19" x2="12" y2="22" />
                     </svg>
                   ) : (
-                    <div className="relative flex items-center justify-center">
+                    <div className="relative flex flex-col items-center gap-1">
                       <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
                         <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
                         <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
                         <line x1="12" y1="19" x2="12" y2="22" />
                       </svg>
+                      {audioLevel > 0.05 && (
+                        <span className="text-[9px] font-bold uppercase tracking-wider text-ink-950/80">
+                          Tap to Send
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
@@ -753,9 +583,11 @@ export default function VoiceCallModal({
           {/* Status Capsule Badge */}
           <div className="flex items-center justify-center">
             <span
-              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border backdrop-blur-md shadow-sm transition-all ${
+              className={`inline-flex items-center gap-1.5 px-3.5 py-1 rounded-full text-xs font-medium border backdrop-blur-md shadow-sm transition-all ${
                 status === "speaking"
                   ? "bg-amber-500/10 text-amber-300 border-amber-500/30"
+                  : status === "transcribing" || status === "thinking"
+                  ? "bg-indigo-500/10 text-indigo-300 border-indigo-500/30"
                   : isMuted
                   ? "bg-rose-500/10 text-rose-300 border-rose-500/30"
                   : "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
@@ -765,12 +597,16 @@ export default function VoiceCallModal({
                 className={`h-1.5 w-1.5 rounded-full ${
                   status === "speaking"
                     ? "bg-amber-400 animate-pulse"
+                    : status === "transcribing" || status === "thinking"
+                    ? "bg-indigo-400 animate-spin"
                     : isMuted
                     ? "bg-rose-400"
                     : "bg-emerald-400 animate-pulse"
                 }`}
               />
               {status === "speaking" && "Sona AI is speaking…"}
+              {status === "transcribing" && "Understanding audio…"}
+              {status === "thinking" && "Sona AI is thinking…"}
               {status === "listening" && (isMuted ? "Microphone is muted" : "Listening to you…")}
               {status === "connecting" && "Connected"}
             </span>
@@ -778,7 +614,7 @@ export default function VoiceCallModal({
 
           {/* 3. Live Speech Subtitle Card */}
           <div className="mt-4 w-full max-w-sm min-h-[68px] flex items-center justify-center rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl px-4 py-2.5 text-center shadow-inner">
-            {status === "listening" && transcript && (
+            {(status === "listening" || status === "transcribing" || status === "thinking") && transcript && (
               <p className="text-xs sm:text-sm italic text-white animate-in fade-in line-clamp-3 leading-relaxed">
                 <span className="text-emerald-400 font-semibold not-italic mr-1.5">You:</span>
                 “{transcript}”
@@ -796,7 +632,13 @@ export default function VoiceCallModal({
               <p className="text-xs text-paper-400 leading-relaxed">
                 {isMuted
                   ? "Microphone is muted. Tap Unmute below to talk."
-                  : "Speak naturally. Sona AI responds automatically."}
+                  : "Speak naturally. Sona AI detects pauses and responds automatically."}
+              </p>
+            )}
+
+            {(status === "transcribing" || status === "thinking") && !transcript && (
+              <p className="text-xs text-indigo-300 animate-pulse leading-relaxed">
+                Processing speech...
               </p>
             )}
           </div>

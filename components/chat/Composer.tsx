@@ -18,37 +18,19 @@ export default function Composer({
   const [isTranscribing, setIsTranscribing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Hardware and recorder refs
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const recognitionRef = useRef<any>(null);
+  // Mobile voice recorder ref
+  const recorderRef = useRef<any>(null);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopRecordingCleanup();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {}
-        recognitionRef.current = null;
+      if (recorderRef.current) {
+        recorderRef.current.destroy();
+        recorderRef.current = null;
       }
     };
   }, []);
-
-  function stopRecordingCleanup() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {}
-      mediaRecorderRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-  }
 
   function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
     const picked = e.target.files?.[0];
@@ -74,13 +56,11 @@ export default function Composer({
   }
 
   // Transcribe recorded audio chunk via ultra-fast server route
-  const transcribeAudioBlob = async (audioBlob: Blob) => {
-    if (audioBlob.size < 200) return; // ignore accidental empty tap
+  const transcribeAudioBlob = async (audioBlob: Blob, ext = "webm") => {
+    if (audioBlob.size < 300) return; // ignore accidental empty tap
 
     setIsTranscribing(true);
     try {
-      const mimeType = audioBlob.type || "audio/webm";
-      const ext = mimeType.includes("mp4") ? "mp4" : "webm";
       const formData = new FormData();
       formData.append("audio", audioBlob, `voice_input.${ext}`);
 
@@ -105,110 +85,45 @@ export default function Composer({
     }
   };
 
-  const stopVoiceInput = useCallback(() => {
+  const stopVoiceInput = useCallback(async () => {
     setIsListening(false);
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
-      } catch {}
-      recognitionRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {}
+    setAudioLevel(0);
+    if (recorderRef.current) {
+      const result = await recorderRef.current.stop();
+      if (result && result.blob) {
+        await transcribeAudioBlob(result.blob, result.extension);
+      }
     }
   }, []);
 
   const startVoiceInput = async () => {
     if (typeof window === "undefined") return;
 
-    // 1. Fast Path: Use native SpeechRecognition for instant zero-latency live typing
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (SpeechRecognition) {
-      try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = "en-US";
-
-        recognition.onstart = () => setIsListening(true);
-        recognition.onend = () => setIsListening(false);
-        recognition.onerror = (e: any) => {
-          if (e.error !== "no-speech") {
-            setIsListening(false);
-          }
-        };
-
-        recognition.onresult = (event: any) => {
-          let fullTranscript = "";
-          for (let i = 0; i < event.results.length; ++i) {
-            fullTranscript += event.results[i][0].transcript + " ";
-          }
-          const clean = fullTranscript.trim();
-          if (clean) {
-            setText(clean);
-          }
-        };
-
-        recognitionRef.current = recognition;
-        recognition.start();
-        return;
-      } catch (err) {
-        console.warn("[Composer] SpeechRecognition init failed, falling back to MediaRecorder:", err);
-      }
-    }
-
-    // 2. Fallback Path: MediaRecorder with ultra-fast Groq Whisper (English enforced)
-    audioChunksRef.current = [];
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      streamRef.current = stream;
+      const { MobileVoiceRecorder } = await import("@/lib/services/audioRecorder");
+      
+      if (!recorderRef.current) {
+        recorderRef.current = new MobileVoiceRecorder({
+          onAudioLevel: (lvl) => setAudioLevel(lvl),
+          enableVAD: true,
+          silenceDurationMs: 1500,
+          onSpeechEnd: () => {
+            stopVoiceInput();
+          },
+        });
+      }
 
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : MediaRecorder.isTypeSupported("audio/mp4")
-        ? "audio/mp4"
-        : "";
-
-      const options = mimeType ? { mimeType } : undefined;
-      const mediaRecorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType || "audio/webm" });
-        audioChunksRef.current = [];
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((t) => t.stop());
-          streamRef.current = null;
-        }
-        transcribeAudioBlob(audioBlob);
-      };
-
-      mediaRecorder.start();
+      await recorderRef.current.start();
       setIsListening(true);
     } catch (err: any) {
-      console.warn("[Composer] getUserMedia notice:", err);
-      alert("Please allow microphone access in your browser settings to use voice typing.");
+      console.warn("[Composer] Mic recording notice:", err);
+      if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        alert("Please allow microphone access in your browser settings to use voice typing.");
+      }
       setIsListening(false);
+      setAudioLevel(0);
     }
   };
-
 
   function toggleVoiceInput() {
     if (isListening) {
@@ -249,9 +164,10 @@ export default function Composer({
                 ? "Listening... (tap to finish)"
                 : "Voice typing"
             }
-            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-all ${
+            style={isListening ? { transform: `scale(${1 + Math.min(0.25, audioLevel * 0.4)})` } : undefined}
+            className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-all duration-75 ${
               isListening
-                ? "border-red-500 bg-red-500/20 text-red-400 animate-pulse ring-2 ring-red-500/30"
+                ? "border-red-500 bg-red-500/20 text-red-400 shadow-md shadow-red-500/30 ring-2 ring-red-500/40"
                 : isTranscribing
                 ? "border-amber-500/50 bg-amber-500/20 text-amber-400 animate-spin"
                 : "border-line text-paper-200 hover:bg-ink-700 hover:text-paper-100"

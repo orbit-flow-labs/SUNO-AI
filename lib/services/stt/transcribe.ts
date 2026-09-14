@@ -28,7 +28,10 @@ export async function transcribeAudioData(
 
       let uploadFile: any = audioData;
       if (typeof Buffer !== "undefined" && Buffer.isBuffer(audioData)) {
-        uploadFile = new File([new Uint8Array(audioData)], filename, { type: "audio/webm" });
+        const mimeType = filename.endsWith(".mp4") || filename.endsWith(".m4a") ? "audio/mp4" : "audio/webm";
+        uploadFile = new File([new Uint8Array(audioData)], filename, { type: mimeType });
+      } else if (audioData instanceof Blob && !(audioData instanceof File)) {
+        uploadFile = new File([audioData], filename, { type: audioData.type || "audio/webm" });
       }
 
       const response = await groq.audio.transcriptions.create({
@@ -37,6 +40,7 @@ export async function transcribeAudioData(
         language: "en",
         response_format: "json",
         temperature: 0.0,
+        prompt: "Conversational audio, natural speech, questions and statements.",
       });
 
       const text = response.text ? response.text.trim() : "";
